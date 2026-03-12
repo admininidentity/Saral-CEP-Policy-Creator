@@ -1,0 +1,5 @@
+{
+  "name": "Saral Chrome Policy Creator",
+  "description": "Automate Google Admin tasks: create OUs, users, assign CEP licenses, and configure Chrome browser policies.",
+  "requestFramePermissions": []
+}
