@@ -110,3 +110,6 @@ export default function App() {
     }
 
     setActionLoading(true);
+    </div>
+  );
+}
