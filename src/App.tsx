@@ -33,17 +33,16 @@ export default function App() {
   const generatePDF = () => {
     const { jsPDF } = (window as any).jspdf;
     const doc = new jsPDF();
+    doc.setFontSize(20);
     doc.text("Saral Provisioning Final Report", 20, 20);
-    doc.text(`Domain: ${auth.domain}`, 20, 35);
-    doc.text(`Target OU: /${ouName}`, 20, 45);
-    doc.text("User & License Status:", 20, 60);
+    doc.setFontSize(10);
+    doc.text(`Domain: ${auth.domain} | OU: /${ouName}`, 20, 30);
+    doc.text("Results:", 20, 45);
     report.users.forEach((u: any, i: number) => {
-      doc.text(`- ${u.name} (${u.email}): ${u.status}`, 25, 70 + (i * 7));
-      doc.text(`  License: ${u.licenseStatus}`, 25, 74 + (i * 7));
+      doc.text(`- ${u.name}: User=${u.status}, CEP License=${u.licenseStatus}`, 25, 55 + (i * 10));
     });
-    doc.text("Policies Configured:", 20, 110);
-    doc.text(`- Incognito Mode Disabled: ${report.policyStatus}`, 25, 117);
-    doc.save("Final_Provisioning_Report.pdf");
+    doc.text(`- Incognito Policy: ${report.policyStatus}`, 25, 90);
+    doc.save("Report.pdf");
   };
 
   const runProvisioning = async () => {
@@ -58,65 +57,62 @@ export default function App() {
         body: JSON.stringify({ name: ouName, parentOrgUnitPath: "/" })
       });
 
-      // 2. Create User and Assign License (With safety catch for "Failed to Fetch")
+      // 2. Create User and License
       const userResults = await Promise.all(usersToCreate.map(async (u) => {
         const email = `${u.username}@${auth.domain}`;
-        let uStatus = "Pending";
-        let lStatus = "Pending";
+        let uStatus = "Error";
+        let lStatus = "Failed";
 
-        try {
-          const userRes = await fetch(`https://admin.googleapis.com/admin/directory/v1/users`, {
-            method: 'POST',
-            headers: { 'Authorization': `Bearer ${auth.token}`, 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              primaryEmail: email,
-              name: { givenName: u.firstName, familyName: u.lastName },
-              password: "Welcome123!",
-              orgUnitPath: orgUnitPath
-            })
-          });
-          uStatus = userRes.ok ? "Success" : "Error/Exists";
+        // A. User
+        const userRes = await fetch(`https://admin.googleapis.com/admin/directory/v1/users`, {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${auth.token}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            primaryEmail: email,
+            name: { givenName: u.firstName, familyName: u.lastName },
+            password: "Welcome123!",
+            orgUnitPath: orgUnitPath
+          })
+        });
+        uStatus = userRes.ok ? "SUCCESS" : "FAILED";
 
-          // Licensing call
-          const licRes = await fetch(`https://licensing.googleapis.com/apps/licensing/v1/product/Google-Chrome-Enterprise/sku/Chrome-Enterprise-Premium/user/${email}`, {
-            method: 'POST',
-            headers: { 'Authorization': `Bearer ${auth.token}`, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ userId: email })
-          });
-          lStatus = licRes.ok ? "ASSIGNED" : "FAILED (Check Billing)";
-        } catch (e) {
-          uStatus = "Fetch Blocked";
-        }
+        // B. License (Specific for CEP)
+        const licRes = await fetch(`https://licensing.googleapis.com/apps/licensing/v1/product/Google-Chrome-Enterprise/sku/Chrome-Enterprise-Premium/user/${email}`, {
+          method: 'POST',
+          headers: { 
+            'Authorization': `Bearer ${auth.token}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ userId: email })
+        });
+        lStatus = licRes.ok ? "ASSIGNED" : "DENIED (Check Billing/API)";
 
         return { name: `${u.firstName} ${u.lastName}`, email, status: uStatus, licenseStatus: lStatus };
       }));
 
       // 3. Policy Apply
-      let pStatus = "FAILED";
-      try {
-        const policyRes = await fetch(`https://chromepolicy.googleapis.com/v1/customers/my_customer/policies/orgunits:batchModify`, {
-          method: 'POST',
-          headers: { 'Authorization': `Bearer ${auth.token}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            requests: [{
-              target_resource: `orgunits/${ouName}`,
-              policy_value: {
-                policy_schema: "chrome.users.IncognitoModeAvailability",
-                value: { "incognitoModeAvailability": "FORCED_DISABLED" }
-              },
-              update_mask: "value"
-            }]
-          })
-        });
-        pStatus = policyRes.ok ? "SUCCESS" : "FAILED";
-      } catch (e) {
-        pStatus = "Fetch Blocked";
-      }
+      const policyRes = await fetch(`https://chromepolicy.googleapis.com/v1/customers/my_customer/policies/orgunits:batchModify`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${auth.token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          requests: [{
+            target_resource: `orgunits/${ouName}`,
+            policy_value: {
+              policy_schema: "chrome.users.IncognitoModeAvailability",
+              value: { "incognitoModeAvailability": 1 } // 1 = Disallowed
+            },
+            update_mask: "value"
+          }]
+        })
+      });
 
-      setReport({ ouPath: orgUnitPath, users: userResults, policyStatus: pStatus });
+      setReport({ 
+        users: userResults, 
+        policyStatus: policyRes.ok ? "SUCCESS" : "FAILED (Check API Enablement)" 
+      });
       setView("report");
     } catch (err: any) {
-      alert("Error: " + err.message);
+      alert("Browser blocked the request. Check Step 1!");
     } finally {
       setActionLoading(false);
     }
@@ -125,15 +121,12 @@ export default function App() {
   return (
     <div className="min-h-screen bg-white">
       {!auth.authenticated ? (
-        <div className="flex items-center justify-center min-h-screen">
-          <button onClick={handleLogin} className="bg-blue-600 text-white p-4 rounded-xl font-bold shadow-lg">Login Super Admin</button>
-        </div>
+        <div className="flex items-center justify-center min-h-screen"><button onClick={handleLogin} className="bg-blue-600 text-white p-6 rounded-2xl font-bold">Admin Login</button></div>
       ) : (
         <main className="max-w-3xl mx-auto p-12">
           {view === "wizard" ? (
             <div className="space-y-6">
-              <h2 className="text-2xl font-bold">Automation Wizard</h2>
-              <input placeholder="OU Name" value={ouName} onChange={(e) => setOuName(e.target.value)} className="w-full border p-4 rounded-xl" />
+              <input placeholder="OU Name" value={ouName} onChange={(e) => setOuName(e.target.value)} className="border p-4 w-full rounded-xl" />
               {usersToCreate.map((u, i) => (
                 <div key={i} className="flex gap-2">
                   <input placeholder="First" onChange={(e) => { const c = [...usersToCreate]; c[i].firstName = e.target.value; setUsersToCreate(c); }} className="border p-2 w-full" />
@@ -141,15 +134,13 @@ export default function App() {
                   <input placeholder="User" onChange={(e) => { const c = [...usersToCreate]; c[i].username = e.target.value; setUsersToCreate(c); }} className="border p-2 w-full" />
                 </div>
               ))}
-              <button onClick={runProvisioning} disabled={actionLoading} className="bg-blue-600 text-white w-full py-4 rounded-xl font-bold">
-                {actionLoading ? "Deploying..." : "Run Deployment"}
-              </button>
+              <button onClick={runProvisioning} className="bg-blue-600 text-white w-full py-4 rounded-xl font-bold">Execute Automation</button>
             </div>
           ) : (
-            <div className="text-center space-y-4">
-              <CheckCircle className="w-20 h-20 text-emerald-500 mx-auto" />
-              <h2 className="text-2xl font-bold">Deployment Process Finished</h2>
-              <button onClick={generatePDF} className="bg-black text-white p-4 rounded-xl w-full">Download PDF Report</button>
+            <div className="text-center space-y-6">
+              <CheckCircle className="w-16 h-16 text-emerald-500 mx-auto" />
+              <h2 className="text-2xl font-bold">Process Complete</h2>
+              <button onClick={generatePDF} className="bg-black text-white p-4 rounded-xl w-full">Get PDF Report</button>
             </div>
           )}
         </main>
