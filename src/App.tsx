@@ -13,9 +13,9 @@ export default function App() {
 
   const handleLogin = () => {
     if (!clientId) return alert("Enter Client ID");
+    localStorage.setItem("google_client_id", clientId);
     const client = (window as any).google.accounts.oauth2.initTokenClient({
       client_id: clientId,
-      // Added Licensing Scope
       scope: 'openid https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/admin.directory.orgunit https://www.googleapis.com/auth/admin.directory.user https://www.googleapis.com/auth/chrome.management.policy https://www.googleapis.com/auth/apps.licensing',
       callback: async (response: any) => {
         if (response.access_token) {
@@ -33,20 +33,17 @@ export default function App() {
   const generatePDF = () => {
     const { jsPDF } = (window as any).jspdf;
     const doc = new jsPDF();
-    doc.setFontSize(20);
     doc.text("Saral Provisioning Final Report", 20, 20);
-    doc.setFontSize(10);
-    doc.text(`Target OU: /${ouName}`, 20, 30);
-    
-    doc.text("User & License Status:", 20, 45);
+    doc.text(`Domain: ${auth.domain}`, 20, 35);
+    doc.text(`Target OU: /${ouName}`, 20, 45);
+    doc.text("User & License Status:", 20, 60);
     report.users.forEach((u: any, i: number) => {
-      doc.text(`- ${u.name} (${u.email}): ${u.status}`, 25, 52 + (i * 7));
-      doc.text(`  CEP License: ${u.licenseStatus}`, 25, 56 + (i * 7));
+      doc.text(`- ${u.name} (${u.email}): ${u.status}`, 25, 70 + (i * 7));
+      doc.text(`  License: ${u.licenseStatus}`, 25, 74 + (i * 7));
     });
-
-    doc.text("Policies Configured:", 20, 100);
-    doc.text(`- Incognito Mode Disabled: ${report.policyStatus}`, 25, 107);
-    doc.save("Final_Report.pdf");
+    doc.text("Policies Configured:", 20, 110);
+    doc.text(`- Incognito Mode Disabled: ${report.policyStatus}`, 25, 117);
+    doc.save("Final_Provisioning_Report.pdf");
   };
 
   const runProvisioning = async () => {
@@ -61,54 +58,62 @@ export default function App() {
         body: JSON.stringify({ name: ouName, parentOrgUnitPath: "/" })
       });
 
-      // 2. Create User and Assign License
+      // 2. Create User and Assign License (With safety catch for "Failed to Fetch")
       const userResults = await Promise.all(usersToCreate.map(async (u) => {
         const email = `${u.username}@${auth.domain}`;
-        
-        // A. Create User
-        const userRes = await fetch(`https://admin.googleapis.com/admin/directory/v1/users`, {
+        let uStatus = "Pending";
+        let lStatus = "Pending";
+
+        try {
+          const userRes = await fetch(`https://admin.googleapis.com/admin/directory/v1/users`, {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${auth.token}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              primaryEmail: email,
+              name: { givenName: u.firstName, familyName: u.lastName },
+              password: "Welcome123!",
+              orgUnitPath: orgUnitPath
+            })
+          });
+          uStatus = userRes.ok ? "Success" : "Error/Exists";
+
+          // Licensing call
+          const licRes = await fetch(`https://licensing.googleapis.com/apps/licensing/v1/product/Google-Chrome-Enterprise/sku/Chrome-Enterprise-Premium/user/${email}`, {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${auth.token}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ userId: email })
+          });
+          lStatus = licRes.ok ? "ASSIGNED" : "FAILED (Check Billing)";
+        } catch (e) {
+          uStatus = "Fetch Blocked";
+        }
+
+        return { name: `${u.firstName} ${u.lastName}`, email, status: uStatus, licenseStatus: lStatus };
+      }));
+
+      // 3. Policy Apply
+      let pStatus = "FAILED";
+      try {
+        const policyRes = await fetch(`https://chromepolicy.googleapis.com/v1/customers/my_customer/policies/orgunits:batchModify`, {
           method: 'POST',
           headers: { 'Authorization': `Bearer ${auth.token}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            primaryEmail: email,
-            name: { givenName: u.firstName, familyName: u.lastName },
-            password: "Welcome123!",
-            orgUnitPath: orgUnitPath
+            requests: [{
+              target_resource: `orgunits/${ouName}`,
+              policy_value: {
+                policy_schema: "chrome.users.IncognitoModeAvailability",
+                value: { "incognitoModeAvailability": "FORCED_DISABLED" }
+              },
+              update_mask: "value"
+            }]
           })
         });
+        pStatus = policyRes.ok ? "SUCCESS" : "FAILED";
+      } catch (e) {
+        pStatus = "Fetch Blocked";
+      }
 
-        // B. Assign CEP License (Chrome Enterprise Premium SKU)
-        const licRes = await fetch(`https://licensing.googleapis.com/apps/licensing/v1/product/Google-Chrome-Enterprise/sku/Chrome-Enterprise-Premium/user/${email}`, {
-          method: 'POST',
-          headers: { 'Authorization': `Bearer ${auth.token}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ userId: email })
-        });
-
-        return { 
-          name: `${u.firstName} ${u.lastName}`, 
-          email, 
-          status: userRes.ok ? "Success" : "Already Exists",
-          licenseStatus: licRes.ok ? "ASSIGNED" : "FAILED/MANUAL ACTION REQ"
-        };
-      }));
-
-      // 3. Apply Policy (Fixed formatting)
-      const policyRes = await fetch(`https://chromepolicy.googleapis.com/v1/customers/my_customer/policies/orgunits:batchModify`, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${auth.token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          requests: [{
-            target_resource: `orgunits/${ouName}`,
-            policy_value: {
-              policy_schema: "chrome.users.IncognitoModeAvailability",
-              value: { "incognitoModeAvailability": "FORCED_DISABLED" }
-            },
-            update_mask: "value"
-          }]
-        })
-      });
-      
-      setReport({ ouPath: orgUnitPath, users: userResults, policyStatus: policyRes.ok ? "SUCCESS" : "FAILED" });
+      setReport({ ouPath: orgUnitPath, users: userResults, policyStatus: pStatus });
       setView("report");
     } catch (err: any) {
       alert("Error: " + err.message);
@@ -117,15 +122,17 @@ export default function App() {
     }
   };
 
-  // ... (Login UI same as before)
   return (
-    <div className="min-h-screen bg-slate-50">
+    <div className="min-h-screen bg-white">
       {!auth.authenticated ? (
-        <div className="flex items-center justify-center min-h-screen"><button onClick={handleLogin} className="bg-blue-600 text-white p-4 rounded-xl">Login Admin</button></div>
+        <div className="flex items-center justify-center min-h-screen">
+          <button onClick={handleLogin} className="bg-blue-600 text-white p-4 rounded-xl font-bold shadow-lg">Login Super Admin</button>
+        </div>
       ) : (
         <main className="max-w-3xl mx-auto p-12">
           {view === "wizard" ? (
             <div className="space-y-6">
+              <h2 className="text-2xl font-bold">Automation Wizard</h2>
               <input placeholder="OU Name" value={ouName} onChange={(e) => setOuName(e.target.value)} className="w-full border p-4 rounded-xl" />
               {usersToCreate.map((u, i) => (
                 <div key={i} className="flex gap-2">
@@ -134,12 +141,15 @@ export default function App() {
                   <input placeholder="User" onChange={(e) => { const c = [...usersToCreate]; c[i].username = e.target.value; setUsersToCreate(c); }} className="border p-2 w-full" />
                 </div>
               ))}
-              <button onClick={runProvisioning} className="bg-blue-600 text-white w-full py-4 rounded-xl">{actionLoading ? "Deploying..." : "Run Deployment"}</button>
+              <button onClick={runProvisioning} disabled={actionLoading} className="bg-blue-600 text-white w-full py-4 rounded-xl font-bold">
+                {actionLoading ? "Deploying..." : "Run Deployment"}
+              </button>
             </div>
           ) : (
             <div className="text-center space-y-4">
-              <h2 className="text-2xl font-bold">Finished!</h2>
-              <button onClick={generatePDF} className="bg-black text-white p-4 rounded-xl w-full">Download Final Report</button>
+              <CheckCircle className="w-20 h-20 text-emerald-500 mx-auto" />
+              <h2 className="text-2xl font-bold">Deployment Process Finished</h2>
+              <button onClick={generatePDF} className="bg-black text-white p-4 rounded-xl w-full">Download PDF Report</button>
             </div>
           )}
         </main>
